@@ -1,5 +1,9 @@
 # rs-task-queue
 
+[![CI](https://github.com/philiprehberger/rs-task-queue/actions/workflows/ci.yml/badge.svg)](https://github.com/philiprehberger/rs-task-queue/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/philiprehberger-task-queue.svg)](https://crates.io/crates/philiprehberger-task-queue)
+[![License](https://img.shields.io/github/license/philiprehberger/rs-task-queue)](LICENSE)
+
 In-process thread-based task queue for Rust with priority scheduling and concurrency control. Zero external dependencies — uses only `std` threading primitives.
 
 ## Installation
