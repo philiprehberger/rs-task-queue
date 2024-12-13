@@ -146,6 +146,8 @@ impl<T> TaskResultSlot<T> {
         *guard = Some(value);
         self.condvar.notify_one();
     }
+
+
 }
 
 impl<T> TaskHandle<T> {
@@ -184,7 +186,10 @@ impl<T> Drop for CancelGuard<T> {
     }
 }
 
-type BoxedTask = Box<dyn FnOnce() + Send>;
+/// Returned by a task closure: signals the result slot after the worker
+/// has finished post-task bookkeeping (stats, callback).
+type TaskCompletion = Box<dyn FnOnce() + Send>;
+type BoxedTask = Box<dyn FnOnce() -> TaskCompletion + Send>;
 
 struct QueueEntry {
     priority: Priority,
@@ -346,9 +351,12 @@ impl TaskQueue {
                 Ok(v) => Ok(v),
                 Err(_) => Err(TaskError::Panicked),
             };
-            cancel_guard.slot.set(value);
+            let slot = Arc::clone(&cancel_guard.slot);
             // Prevent the Drop impl from overwriting the result with Cancelled
             std::mem::forget(cancel_guard);
+            // Return a completion callback that the worker calls AFTER stats
+            // and on_complete callback, so join() doesn't return prematurely.
+            Box::new(move || slot.set(value))
         });
 
         self.stats.total_submitted.fetch_add(1, AtomicOrdering::Relaxed);
@@ -564,7 +572,7 @@ fn worker_loop(
             Some(task) => {
                 stats.in_flight.fetch_add(1, AtomicOrdering::SeqCst);
                 let start = Instant::now();
-                task();
+                let completion = task();
                 let elapsed = start.elapsed();
                 stats.in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
 
@@ -584,6 +592,10 @@ fn worker_loop(
                         cb(success, elapsed);
                     }
                 }
+
+                // Now set the result and notify the TaskHandle — this ensures
+                // stats and callback have both completed before join() returns.
+                completion();
 
                 // Notify condvar so drain() can check progress.
                 condvar.notify_all();
