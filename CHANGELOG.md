@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1 (2026-03-17)
+
+- Fix race condition where `join()` could return before `on_complete` callback and stats were updated
+- Task result delivery is now deferred until after worker bookkeeping completes
+
 ## 0.2.0
 
 - Add `TaskQueueStats` and `stats()` method for observability (total submitted, completed, failed, in-flight)
