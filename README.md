@@ -4,15 +4,13 @@
 [![Crates.io](https://img.shields.io/crates/v/philiprehberger-task-queue.svg)](https://crates.io/crates/philiprehberger-task-queue)
 [![License](https://img.shields.io/github/license/philiprehberger/rs-task-queue)](LICENSE)
 
-In-process thread-based task queue for Rust with priority scheduling and concurrency control. Zero external dependencies — uses only `std` threading primitives.
+In-process thread-based task queue with priority and concurrency control
 
 ## Installation
 
-Add to your `Cargo.toml`:
-
 ```toml
 [dependencies]
-philiprehberger-task-queue = "0.2.0"
+philiprehberger-task-queue = "0.2.1"
 ```
 
 ## Usage
