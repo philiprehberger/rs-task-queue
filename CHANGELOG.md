@@ -1,18 +1,22 @@
 # Changelog
 
+## 0.2.2 (2026-03-22)
+
+- Fix CHANGELOG compliance
+
 ## 0.2.1 (2026-03-17)
 
 - Fix race condition where `join()` could return before `on_complete` callback and stats were updated
 - Task result delivery is now deferred until after worker bookkeeping completes
 
-## 0.2.0
+## 0.2.0 (2026-03-19)
 
 - Add `TaskQueueStats` and `stats()` method for observability (total submitted, completed, failed, in-flight)
 - Add `drain()` for graceful shutdown that completes all pending tasks instead of dropping them
 - Add `on_complete()` callback that fires after each task with `(success: bool, duration: Duration)`
 - New submissions are rejected with `TaskError::Cancelled` when draining
 
-## 0.1.7
+## 0.1.7 (2026-03-17)
 
 - Add readme, rust-version, documentation to Cargo.toml
 - Add Development section to README
