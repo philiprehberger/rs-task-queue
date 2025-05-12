@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.3 (2026-03-22)
+
+- Fix CHANGELOG date ordering
+
 ## 0.2.2 (2026-03-22)
 
 - Fix CHANGELOG compliance
@@ -9,7 +13,7 @@
 - Fix race condition where `join()` could return before `on_complete` callback and stats were updated
 - Task result delivery is now deferred until after worker bookkeeping completes
 
-## 0.2.0 (2026-03-19)
+## 0.2.0 (2026-03-16)
 
 - Add `TaskQueueStats` and `stats()` method for observability (total submitted, completed, failed, in-flight)
 - Add `drain()` for graceful shutdown that completes all pending tasks instead of dropping them
