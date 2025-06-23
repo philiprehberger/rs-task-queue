@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.4 (2026-03-22)
+
+- Fix CHANGELOG date ordering for v0.1.7
+
 ## 0.2.3 (2026-03-22)
 
 - Fix CHANGELOG date ordering
@@ -20,7 +24,7 @@
 - Add `on_complete()` callback that fires after each task with `(success: bool, duration: Duration)`
 - New submissions are rejected with `TaskError::Cancelled` when draining
 
-## 0.1.7 (2026-03-17)
+## 0.1.7 (2026-03-16)
 
 - Add readme, rust-version, documentation to Cargo.toml
 - Add Development section to README
