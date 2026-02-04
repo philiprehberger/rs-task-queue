@@ -10,7 +10,7 @@ In-process thread-based task queue with priority and concurrency control
 
 ```toml
 [dependencies]
-philiprehberger-task-queue = "0.2.5"
+philiprehberger-task-queue = "0.3.0"
 ```
 
 ## Usage
@@ -102,16 +102,65 @@ queue.submit(|| "work").join().unwrap();
 queue.shutdown();
 ```
 
+### Queue Capacity Limit
+
+Limit the queue size to apply backpressure:
+
+```rust
+use philiprehberger_task_queue::{TaskQueue, TaskError};
+
+// Allow at most 100 pending tasks
+let queue = TaskQueue::with_capacity(4, 100);
+
+let handle = queue.submit(|| 42);
+assert_eq!(handle.join().unwrap(), 42);
+
+queue.shutdown();
+```
+
+### Pause and Resume
+
+Temporarily stop processing without shutting down:
+
+```rust
+use philiprehberger_task_queue::TaskQueue;
+
+let queue = TaskQueue::new(4);
+queue.pause();
+
+queue.submit(|| println!("queued but not yet running"));
+
+queue.resume(); // workers start processing again
+queue.shutdown();
+```
+
+### Queue Depth
+
+Check how many tasks are waiting:
+
+```rust
+use philiprehberger_task_queue::TaskQueue;
+
+let queue = TaskQueue::new(2);
+println!("pending: {}", queue.pending_count());
+queue.shutdown();
+```
+
 ## API
 
 | Item | Description |
 |------|-------------|
 | `TaskQueue::new(concurrency)` | Create a queue with N worker threads |
+| `TaskQueue::with_capacity(concurrency, max_queued)` | Create a queue with a maximum pending task limit |
 | `queue.submit(task)` | Submit a task at Normal priority; returns `TaskHandle<T>` |
 | `queue.submit_with_priority(priority, task)` | Submit a task at the given priority; returns `TaskHandle<T>` |
 | `queue.stats()` | Return a `TaskQueueStats` snapshot (submitted, completed, failed, in-flight) |
 | `queue.drain()` | Stop accepting tasks, wait for all queued tasks to finish, then shut down |
 | `queue.on_complete(callback)` | Register a `Fn(bool, Duration)` callback fired after each task |
+| `queue.pause()` | Temporarily stop processing tasks |
+| `queue.resume()` | Resume processing after pause |
+| `queue.is_paused()` | Check if processing is paused |
+| `queue.pending_count()` | Get number of tasks waiting in the queue |
 | `queue.shutdown()` | Signal workers to stop, wait for running tasks, drop pending |
 | `handle.join()` | Block until the task completes; returns `Result<T, TaskError>` |
 | `handle.is_done()` | Check if the task has completed without blocking |
@@ -120,6 +169,7 @@ queue.shutdown();
 | `Priority::Low` | Lowest execution priority |
 | `TaskError::Panicked` | Task panicked during execution |
 | `TaskError::Cancelled` | Task was dropped during shutdown before it ran |
+| `TaskError::QueueFull` | Task rejected because queue is at capacity |
 
 ## Development
 
