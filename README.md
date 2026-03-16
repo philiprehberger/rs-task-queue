@@ -12,7 +12,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-philiprehberger-task-queue = "0.1"
+philiprehberger-task-queue = "0.1.6"
 ```
 
 ## Usage
