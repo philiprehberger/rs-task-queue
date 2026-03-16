@@ -12,7 +12,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-philiprehberger-task-queue = "0.1.6"
+philiprehberger-task-queue = "0.1.7"
 ```
 
 ## Usage
@@ -64,6 +64,14 @@ queue.shutdown();
 | `Priority::Low` | Lowest execution priority |
 | `TaskError::Panicked` | Task panicked during execution |
 | `TaskError::Cancelled` | Task was dropped during shutdown before it ran |
+
+
+## Development
+
+```bash
+cargo test
+cargo clippy -- -D warnings
+```
 
 ## License
 

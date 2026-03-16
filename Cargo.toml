@@ -1,10 +1,13 @@
 [package]
 name = "philiprehberger-task-queue"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 authors = ["Philip Rehberger"]
 description = "In-process thread-based task queue with priority and concurrency control"
 license = "MIT"
 repository = "https://github.com/philiprehberger/rs-task-queue"
+readme = "README.md"
+rust-version = "1.70"
+documentation = "https://docs.rs/philiprehberger-task-queue"
 keywords = ["task", "queue", "thread", "job", "background"]
 categories = ["concurrency"]
