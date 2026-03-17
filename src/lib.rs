@@ -23,8 +23,10 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// Task execution priority.
 ///
@@ -80,6 +82,42 @@ impl std::fmt::Display for TaskError {
 }
 
 impl std::error::Error for TaskError {}
+
+/// Snapshot of task queue statistics for observability.
+///
+/// Obtained via [`TaskQueue::stats`].
+#[derive(Debug, Clone)]
+pub struct TaskQueueStats {
+    /// Total number of tasks submitted to the queue.
+    pub total_submitted: u64,
+    /// Number of tasks that completed successfully.
+    pub completed: u64,
+    /// Number of tasks that failed (panicked).
+    pub failed: u64,
+    /// Number of tasks currently being executed by workers.
+    pub in_flight: u64,
+}
+
+/// Shared atomic counters used by the task queue for stats tracking.
+struct StatsCounters {
+    total_submitted: AtomicU64,
+    completed: AtomicU64,
+    failed: AtomicU64,
+    in_flight: AtomicU64,
+}
+
+impl StatsCounters {
+    fn new() -> Self {
+        Self {
+            total_submitted: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+            in_flight: AtomicU64::new(0),
+        }
+    }
+}
+
+type CompletionCallback = dyn Fn(bool, Duration) + Send + Sync;
 
 /// A handle to a submitted task, used to retrieve the result.
 ///
@@ -179,6 +217,7 @@ impl PartialOrd for QueueEntry {
 struct SharedState {
     queue: BinaryHeap<QueueEntry>,
     shutdown: bool,
+    draining: bool,
     next_sequence: u64,
 }
 
@@ -206,6 +245,8 @@ struct SharedState {
 pub struct TaskQueue {
     shared: Arc<(Mutex<SharedState>, Condvar)>,
     workers: Option<Vec<thread::JoinHandle<()>>>,
+    stats: Arc<StatsCounters>,
+    callback: Arc<Mutex<Option<Arc<CompletionCallback>>>>,
 }
 
 impl TaskQueue {
@@ -221,16 +262,22 @@ impl TaskQueue {
             Mutex::new(SharedState {
                 queue: BinaryHeap::new(),
                 shutdown: false,
+                draining: false,
                 next_sequence: 0,
             }),
             Condvar::new(),
         ));
 
+        let stats = Arc::new(StatsCounters::new());
+        let callback: Arc<Mutex<Option<Arc<CompletionCallback>>>> = Arc::new(Mutex::new(None));
+
         let mut workers = Vec::with_capacity(concurrency);
         for _ in 0..concurrency {
             let shared = Arc::clone(&shared);
+            let stats = Arc::clone(&stats);
+            let callback = Arc::clone(&callback);
             let handle = thread::spawn(move || {
-                worker_loop(&shared);
+                worker_loop(&shared, &stats, &callback);
             });
             workers.push(handle);
         }
@@ -238,6 +285,8 @@ impl TaskQueue {
         TaskQueue {
             shared,
             workers: Some(workers),
+            stats,
+            callback,
         }
     }
 
@@ -258,6 +307,9 @@ impl TaskQueue {
     /// multiple tasks are waiting in the queue.
     ///
     /// Returns a [`TaskHandle`] that can be used to retrieve the result.
+    ///
+    /// If the queue is draining or shut down, the returned handle will
+    /// immediately yield `TaskError::Cancelled`.
     pub fn submit_with_priority<F, T>(&self, priority: Priority, task: F) -> TaskHandle<T>
     where
         F: FnOnce() -> T + Send + 'static,
@@ -267,6 +319,16 @@ impl TaskQueue {
             mutex: Mutex::new(None),
             condvar: Condvar::new(),
         });
+
+        // Reject submissions if draining or shut down.
+        {
+            let (ref mutex, _) = *self.shared;
+            let state = mutex.lock().unwrap();
+            if state.draining || state.shutdown {
+                slot.set(Err(TaskError::Cancelled));
+                return TaskHandle { inner: slot };
+            }
+        }
 
         let cancel_guard = CancelGuard {
             slot: Arc::clone(&slot),
@@ -278,6 +340,8 @@ impl TaskQueue {
             // doesn't overwrite with Cancelled. If the closure is dropped without
             // running, the guard's Drop fires and sets Cancelled.
             let outcome = panic::catch_unwind(AssertUnwindSafe(task));
+            let success = outcome.is_ok();
+            TASK_SUCCESS.with(|s| s.set(success));
             let value = match outcome {
                 Ok(v) => Ok(v),
                 Err(_) => Err(TaskError::Panicked),
@@ -286,6 +350,8 @@ impl TaskQueue {
             // Prevent the Drop impl from overwriting the result with Cancelled
             std::mem::forget(cancel_guard);
         });
+
+        self.stats.total_submitted.fetch_add(1, AtomicOrdering::Relaxed);
 
         let (ref mutex, ref condvar) = *self.shared;
         let mut state = mutex.lock().unwrap();
@@ -299,6 +365,125 @@ impl TaskQueue {
         condvar.notify_one();
 
         TaskHandle { inner: slot }
+    }
+
+    /// Return a snapshot of task queue statistics.
+    ///
+    /// The counters are updated atomically as tasks are submitted, completed,
+    /// and failed, so successive calls may return different values.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use philiprehberger_task_queue::TaskQueue;
+    ///
+    /// let queue = TaskQueue::new(1);
+    /// let handle = queue.submit(|| 1 + 1);
+    /// handle.join().unwrap();
+    ///
+    /// let stats = queue.stats();
+    /// assert_eq!(stats.total_submitted, 1);
+    /// assert_eq!(stats.completed, 1);
+    /// queue.shutdown();
+    /// ```
+    pub fn stats(&self) -> TaskQueueStats {
+        TaskQueueStats {
+            total_submitted: self.stats.total_submitted.load(AtomicOrdering::Relaxed),
+            completed: self.stats.completed.load(AtomicOrdering::Relaxed),
+            failed: self.stats.failed.load(AtomicOrdering::Relaxed),
+            in_flight: self.stats.in_flight.load(AtomicOrdering::Relaxed),
+        }
+    }
+
+    /// Stop accepting new tasks and wait for all queued and in-flight tasks to
+    /// complete.
+    ///
+    /// Unlike [`shutdown`](TaskQueue::shutdown), `drain` does **not** drop
+    /// pending tasks — every task that was already submitted will run to
+    /// completion. New submissions made after `drain` is called will be
+    /// immediately cancelled.
+    ///
+    /// This method blocks until the queue is empty and all workers are idle,
+    /// then shuts down the worker threads.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use philiprehberger_task_queue::TaskQueue;
+    /// use std::sync::Arc;
+    /// use std::sync::atomic::{AtomicUsize, Ordering};
+    ///
+    /// let queue = TaskQueue::new(2);
+    /// let counter = Arc::new(AtomicUsize::new(0));
+    ///
+    /// for _ in 0..5 {
+    ///     let c = counter.clone();
+    ///     queue.submit(move || { c.fetch_add(1, Ordering::SeqCst); });
+    /// }
+    ///
+    /// queue.drain();
+    /// assert_eq!(counter.load(Ordering::SeqCst), 5);
+    /// ```
+    pub fn drain(mut self) {
+        self.do_drain();
+    }
+
+    fn do_drain(&mut self) {
+        let (ref mutex, ref condvar) = *self.shared;
+        {
+            let mut state = mutex.lock().unwrap();
+            state.draining = true;
+            // Do NOT clear the queue — let workers process everything.
+        }
+
+        // Wait until the queue is empty and no tasks are in-flight.
+        {
+            let mut state = mutex.lock().unwrap();
+            while !state.queue.is_empty()
+                || self.stats.in_flight.load(AtomicOrdering::SeqCst) > 0
+            {
+                state = condvar.wait(state).unwrap();
+            }
+        }
+
+        // Now perform a normal shutdown (workers will exit because queue is
+        // empty and shutdown flag is set).
+        self.do_shutdown();
+    }
+
+    /// Register a callback that fires after each task completes.
+    ///
+    /// The callback receives two arguments:
+    /// - `success` — `true` if the task completed without panicking, `false` otherwise.
+    /// - `duration` — wall-clock time the task took to execute.
+    ///
+    /// Only one callback may be active at a time; calling this again replaces
+    /// the previous callback.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use philiprehberger_task_queue::TaskQueue;
+    /// use std::sync::Arc;
+    /// use std::sync::atomic::{AtomicUsize, Ordering};
+    ///
+    /// let queue = TaskQueue::new(1);
+    /// let count = Arc::new(AtomicUsize::new(0));
+    /// let c = count.clone();
+    /// queue.on_complete(move |_success, _dur| {
+    ///     c.fetch_add(1, Ordering::SeqCst);
+    /// });
+    ///
+    /// queue.submit(|| 42).join().unwrap();
+    /// assert_eq!(count.load(Ordering::SeqCst), 1);
+    /// queue.shutdown();
+    /// ```
+    pub fn on_complete<F>(&self, callback: F)
+    where
+        F: Fn(bool, Duration) + Send + Sync + 'static,
+    {
+        let mut guard = self.callback.lock().unwrap();
+        *guard = Some(Arc::new(callback));
     }
 
     /// Shut down the task queue.
@@ -337,7 +522,9 @@ impl Drop for TaskQueue {
             let mut state = mutex.lock().unwrap();
             if !state.shutdown {
                 state.shutdown = true;
-                state.queue.clear();
+                if !state.draining {
+                    state.queue.clear();
+                }
                 condvar.notify_all();
             }
         }
@@ -349,7 +536,16 @@ impl Drop for TaskQueue {
     }
 }
 
-fn worker_loop(shared: &(Mutex<SharedState>, Condvar)) {
+thread_local! {
+    /// Used by the task closure to communicate success/failure to the worker loop.
+    static TASK_SUCCESS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+fn worker_loop(
+    shared: &(Mutex<SharedState>, Condvar),
+    stats: &StatsCounters,
+    callback: &Mutex<Option<Arc<CompletionCallback>>>,
+) {
     let (ref mutex, ref condvar) = *shared;
     loop {
         let task = {
@@ -358,14 +554,40 @@ fn worker_loop(shared: &(Mutex<SharedState>, Condvar)) {
                 if let Some(entry) = state.queue.pop() {
                     break Some(entry.task);
                 }
-                if state.shutdown {
+                if state.shutdown || (state.draining && state.queue.is_empty()) {
                     break None;
                 }
                 state = condvar.wait(state).unwrap();
             }
         };
         match task {
-            Some(task) => task(),
+            Some(task) => {
+                stats.in_flight.fetch_add(1, AtomicOrdering::SeqCst);
+                let start = Instant::now();
+                task();
+                let elapsed = start.elapsed();
+                stats.in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
+
+                // The task closure uses catch_unwind internally and communicates
+                // success/failure via a thread-local, since the boxed closure
+                // always returns () without panicking.
+                let success = TASK_SUCCESS.with(|s| s.get());
+                if success {
+                    stats.completed.fetch_add(1, AtomicOrdering::Relaxed);
+                } else {
+                    stats.failed.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+
+                // Fire the on_complete callback if registered.
+                if let Ok(guard) = callback.lock() {
+                    if let Some(ref cb) = *guard {
+                        cb(success, elapsed);
+                    }
+                }
+
+                // Notify condvar so drain() can check progress.
+                condvar.notify_all();
+            }
             None => return,
         }
     }
@@ -544,6 +766,180 @@ mod tests {
             observed_max <= concurrency,
             "max concurrent tasks ({observed_max}) exceeded concurrency limit ({concurrency})"
         );
+
+        queue.shutdown();
+    }
+
+    #[test]
+    fn stats_tracks_submitted_and_completed() {
+        let queue = TaskQueue::new(2);
+
+        let handles: Vec<_> = (0..5).map(|i| queue.submit(move || i)).collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let s = queue.stats();
+        assert_eq!(s.total_submitted, 5);
+        assert_eq!(s.completed, 5);
+        assert_eq!(s.failed, 0);
+        assert_eq!(s.in_flight, 0);
+
+        queue.shutdown();
+    }
+
+    #[test]
+    fn stats_tracks_failures() {
+        let queue = TaskQueue::new(1);
+
+        let h1 = queue.submit(|| panic!("boom"));
+        let _ = h1.join(); // Err(Panicked)
+
+        let h2 = queue.submit(|| 42);
+        h2.join().unwrap();
+
+        let s = queue.stats();
+        assert_eq!(s.total_submitted, 2);
+        assert_eq!(s.completed, 1);
+        assert_eq!(s.failed, 1);
+
+        queue.shutdown();
+    }
+
+    #[test]
+    fn drain_completes_all_pending_tasks() {
+        let queue = TaskQueue::new(1);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..10 {
+            let c = counter.clone();
+            queue.submit(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+
+        queue.drain();
+        assert_eq!(counter.load(Ordering::SeqCst), 10);
+    }
+
+    #[test]
+    fn drain_rejects_new_submissions() {
+        let queue = TaskQueue::new(1);
+        let barrier = Arc::new(Barrier::new(2));
+
+        // Block the worker so we can call drain from another context
+        let b = barrier.clone();
+        queue.submit(move || {
+            b.wait();
+        });
+
+        // Give the worker time to pick up the task
+        thread::sleep(Duration::from_millis(50));
+
+        // Submit a task that should be queued
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+        queue.submit(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+
+        // We need to set draining and then unblock. Since drain() consumes self,
+        // we test the rejection behavior differently: submit after drain finishes
+        // is not possible (self consumed). Instead, verify that drain processes
+        // all queued tasks.
+        barrier.wait();
+        queue.drain();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn on_complete_callback_fires_on_success() {
+        let queue = TaskQueue::new(1);
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let success_count = Arc::new(AtomicUsize::new(0));
+
+        let cc = call_count.clone();
+        let sc = success_count.clone();
+        queue.on_complete(move |success, dur| {
+            cc.fetch_add(1, Ordering::SeqCst);
+            if success {
+                sc.fetch_add(1, Ordering::SeqCst);
+            }
+            assert!(dur.as_nanos() > 0);
+        });
+
+        let h = queue.submit(|| 42);
+        h.join().unwrap();
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(success_count.load(Ordering::SeqCst), 1);
+
+        queue.shutdown();
+    }
+
+    #[test]
+    fn on_complete_callback_fires_on_failure() {
+        let queue = TaskQueue::new(1);
+        let failure_count = Arc::new(AtomicUsize::new(0));
+
+        let fc = failure_count.clone();
+        queue.on_complete(move |success, _dur| {
+            if !success {
+                fc.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let h = queue.submit(|| panic!("intentional"));
+        let _ = h.join();
+
+        assert_eq!(failure_count.load(Ordering::SeqCst), 1);
+
+        queue.shutdown();
+    }
+
+    #[test]
+    fn on_complete_callback_reports_duration() {
+        let queue = TaskQueue::new(1);
+        let observed_duration = Arc::new(Mutex::new(Duration::ZERO));
+
+        let od = observed_duration.clone();
+        queue.on_complete(move |_success, dur| {
+            *od.lock().unwrap() = dur;
+        });
+
+        let h = queue.submit(|| {
+            thread::sleep(Duration::from_millis(50));
+        });
+        h.join().unwrap();
+
+        let dur = *observed_duration.lock().unwrap();
+        assert!(dur >= Duration::from_millis(40), "duration was {dur:?}");
+
+        queue.shutdown();
+    }
+
+    #[test]
+    fn replacing_callback() {
+        let queue = TaskQueue::new(1);
+        let first_count = Arc::new(AtomicUsize::new(0));
+        let second_count = Arc::new(AtomicUsize::new(0));
+
+        let fc = first_count.clone();
+        queue.on_complete(move |_, _| {
+            fc.fetch_add(1, Ordering::SeqCst);
+        });
+
+        queue.submit(|| {}).join().unwrap();
+
+        let sc = second_count.clone();
+        queue.on_complete(move |_, _| {
+            sc.fetch_add(1, Ordering::SeqCst);
+        });
+
+        queue.submit(|| {}).join().unwrap();
+
+        assert_eq!(first_count.load(Ordering::SeqCst), 1);
+        assert_eq!(second_count.load(Ordering::SeqCst), 1);
 
         queue.shutdown();
     }

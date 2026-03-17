@@ -12,7 +12,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-philiprehberger-task-queue = "0.1.7"
+philiprehberger-task-queue = "0.2.0"
 ```
 
 ## Usage
@@ -49,6 +49,61 @@ if handle.is_done() {
 queue.shutdown();
 ```
 
+### Stats
+
+Get a real-time snapshot of queue activity:
+
+```rust
+use philiprehberger_task_queue::TaskQueue;
+
+let queue = TaskQueue::new(2);
+queue.submit(|| 1 + 1).join().unwrap();
+
+let stats = queue.stats();
+println!("submitted={} completed={} failed={} in_flight={}",
+    stats.total_submitted, stats.completed, stats.failed, stats.in_flight);
+
+queue.shutdown();
+```
+
+### Drain
+
+Graceful shutdown that completes all pending tasks instead of dropping them:
+
+```rust
+use philiprehberger_task_queue::TaskQueue;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+let queue = TaskQueue::new(2);
+let counter = Arc::new(AtomicUsize::new(0));
+
+for _ in 0..10 {
+    let c = counter.clone();
+    queue.submit(move || { c.fetch_add(1, Ordering::SeqCst); });
+}
+
+// Waits for all 10 tasks to finish, then shuts down
+queue.drain();
+assert_eq!(counter.load(Ordering::SeqCst), 10);
+```
+
+### Callbacks
+
+Register a callback that fires after every task completes:
+
+```rust
+use philiprehberger_task_queue::TaskQueue;
+
+let queue = TaskQueue::new(2);
+queue.on_complete(|success, duration| {
+    println!("task finished: success={success} took={duration:?}");
+});
+
+queue.submit(|| "work").join().unwrap();
+queue.shutdown();
+```
+
 ## API
 
 | Item | Description |
@@ -56,6 +111,9 @@ queue.shutdown();
 | `TaskQueue::new(concurrency)` | Create a queue with N worker threads |
 | `queue.submit(task)` | Submit a task at Normal priority; returns `TaskHandle<T>` |
 | `queue.submit_with_priority(priority, task)` | Submit a task at the given priority; returns `TaskHandle<T>` |
+| `queue.stats()` | Return a `TaskQueueStats` snapshot (submitted, completed, failed, in-flight) |
+| `queue.drain()` | Stop accepting tasks, wait for all queued tasks to finish, then shut down |
+| `queue.on_complete(callback)` | Register a `Fn(bool, Duration)` callback fired after each task |
 | `queue.shutdown()` | Signal workers to stop, wait for running tasks, drop pending |
 | `handle.join()` | Block until the task completes; returns `Result<T, TaskError>` |
 | `handle.is_done()` | Check if the task has completed without blocking |
