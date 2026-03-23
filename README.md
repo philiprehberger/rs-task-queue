@@ -10,7 +10,7 @@ In-process thread-based task queue with priority and concurrency control
 
 ```toml
 [dependencies]
-philiprehberger-task-queue = "0.2.3"
+philiprehberger-task-queue = "0.2.4"
 ```
 
 ## Usage
