@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.5 (2026-03-27)
+
+- Add GitHub issue templates, PR template, and dependabot configuration
+- Update README badges and add Support section
+
 ## 0.2.4 (2026-03-22)
 
 - Fix CHANGELOG date ordering for v0.1.7
