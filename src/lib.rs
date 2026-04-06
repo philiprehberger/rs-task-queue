@@ -70,6 +70,8 @@ pub enum TaskError {
     Panicked,
     /// The task was cancelled because the queue shut down before it could run.
     Cancelled,
+    /// The task was rejected because the queue is at capacity.
+    QueueFull,
 }
 
 impl std::fmt::Display for TaskError {
@@ -77,6 +79,7 @@ impl std::fmt::Display for TaskError {
         match self {
             TaskError::Panicked => write!(f, "task panicked"),
             TaskError::Cancelled => write!(f, "task cancelled"),
+            TaskError::QueueFull => write!(f, "task rejected: queue is full"),
         }
     }
 }
@@ -224,6 +227,8 @@ struct SharedState {
     shutdown: bool,
     draining: bool,
     next_sequence: u64,
+    max_queued: Option<usize>,
+    paused: bool,
 }
 
 /// A thread-based task queue with configurable concurrency and priority scheduling.
@@ -269,6 +274,8 @@ impl TaskQueue {
                 shutdown: false,
                 draining: false,
                 next_sequence: 0,
+                max_queued: None,
+                paused: false,
             }),
             Condvar::new(),
         ));
@@ -293,6 +300,54 @@ impl TaskQueue {
             stats,
             callback,
         }
+    }
+
+    /// Create a new task queue with a maximum pending task limit.
+    ///
+    /// When the queue contains `max_queued` or more pending tasks, new
+    /// submissions are rejected and the returned handle will yield
+    /// `TaskError::QueueFull` on join.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `concurrency` is zero.
+    pub fn with_capacity(concurrency: usize, max_queued: usize) -> Self {
+        let queue = Self::new(concurrency);
+        {
+            let (ref mutex, _) = *queue.shared;
+            mutex.lock().unwrap().max_queued = Some(max_queued);
+        }
+        queue
+    }
+
+    /// Temporarily stop workers from processing tasks.
+    ///
+    /// Tasks can still be submitted while paused, but workers will not
+    /// dequeue them until [`resume`](TaskQueue::resume) is called.
+    /// Draining overrides the pause — [`drain`](TaskQueue::drain) will
+    /// complete all pending tasks even if the queue is paused.
+    pub fn pause(&self) {
+        let (ref mutex, _) = *self.shared;
+        mutex.lock().unwrap().paused = true;
+    }
+
+    /// Resume processing after a call to [`pause`](TaskQueue::pause).
+    pub fn resume(&self) {
+        let (ref mutex, ref condvar) = *self.shared;
+        mutex.lock().unwrap().paused = false;
+        condvar.notify_all();
+    }
+
+    /// Check whether task processing is currently paused.
+    pub fn is_paused(&self) -> bool {
+        let (ref mutex, _) = *self.shared;
+        mutex.lock().unwrap().paused
+    }
+
+    /// Return the number of tasks waiting in the queue.
+    pub fn pending_count(&self) -> usize {
+        let (ref mutex, _) = *self.shared;
+        mutex.lock().unwrap().queue.len()
     }
 
     /// Submit a task with `Normal` priority.
@@ -325,13 +380,19 @@ impl TaskQueue {
             condvar: Condvar::new(),
         });
 
-        // Reject submissions if draining or shut down.
+        // Reject submissions if draining, shut down, or queue is full.
         {
             let (ref mutex, _) = *self.shared;
             let state = mutex.lock().unwrap();
             if state.draining || state.shutdown {
                 slot.set(Err(TaskError::Cancelled));
                 return TaskHandle { inner: slot };
+            }
+            if let Some(max) = state.max_queued {
+                if state.queue.len() >= max {
+                    slot.set(Err(TaskError::QueueFull));
+                    return TaskHandle { inner: slot };
+                }
             }
         }
 
@@ -442,6 +503,8 @@ impl TaskQueue {
             let mut state = mutex.lock().unwrap();
             state.draining = true;
             // Do NOT clear the queue — let workers process everything.
+            // Wake workers in case the queue was paused.
+            condvar.notify_all();
         }
 
         // Wait until the queue is empty and no tasks are in-flight.
@@ -559,8 +622,10 @@ fn worker_loop(
         let task = {
             let mut state = mutex.lock().unwrap();
             loop {
-                if let Some(entry) = state.queue.pop() {
-                    break Some(entry.task);
+                if !state.paused || state.draining {
+                    if let Some(entry) = state.queue.pop() {
+                        break Some(entry.task);
+                    }
                 }
                 if state.shutdown || (state.draining && state.queue.is_empty()) {
                     break None;
@@ -954,5 +1019,112 @@ mod tests {
         assert_eq!(second_count.load(Ordering::SeqCst), 1);
 
         queue.shutdown();
+    }
+
+    #[test]
+    fn test_with_capacity_rejects_when_full() {
+        let queue = TaskQueue::with_capacity(1, 2);
+        // Pause so tasks don't get consumed
+        queue.pause();
+
+        let h1 = queue.submit(|| 1);
+        let h2 = queue.submit(|| 2);
+        let h3 = queue.submit(|| 3); // should be rejected
+
+        // h3 should immediately return QueueFull
+        queue.resume();
+        assert!(matches!(h3.join(), Err(TaskError::QueueFull)));
+
+        // h1 and h2 should succeed
+        assert!(h1.join().is_ok());
+        assert!(h2.join().is_ok());
+        queue.shutdown();
+    }
+
+    #[test]
+    fn test_with_capacity_allows_within_limit() {
+        let queue = TaskQueue::with_capacity(2, 10);
+        let handles: Vec<_> = (0..10).map(|i| queue.submit(move || i)).collect();
+        for (i, h) in handles.into_iter().enumerate() {
+            assert_eq!(h.join().unwrap(), i);
+        }
+        queue.shutdown();
+    }
+
+    #[test]
+    fn test_pause_and_resume() {
+        let queue = TaskQueue::new(2);
+        queue.pause();
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+        queue.submit(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+
+        // Give workers time to potentially process (they shouldn't)
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        queue.resume();
+        // Give time to process
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        queue.shutdown();
+    }
+
+    #[test]
+    fn test_is_paused() {
+        let queue = TaskQueue::new(1);
+        assert!(!queue.is_paused());
+        queue.pause();
+        assert!(queue.is_paused());
+        queue.resume();
+        assert!(!queue.is_paused());
+        queue.shutdown();
+    }
+
+    #[test]
+    fn test_drain_overrides_pause() {
+        let queue = TaskQueue::new(2);
+        queue.pause();
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        for _ in 0..5 {
+            let c = counter.clone();
+            queue.submit(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+
+        // Drain should complete all tasks even though paused
+        queue.drain();
+        assert_eq!(counter.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn test_pending_count() {
+        let queue = TaskQueue::new(1);
+        queue.pause();
+
+        assert_eq!(queue.pending_count(), 0);
+        queue.submit(|| 1);
+        queue.submit(|| 2);
+        assert_eq!(queue.pending_count(), 2);
+
+        queue.resume();
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(queue.pending_count(), 0);
+
+        queue.shutdown();
+    }
+
+    #[test]
+    fn test_queue_full_error_display() {
+        assert_eq!(
+            format!("{}", TaskError::QueueFull),
+            "task rejected: queue is full"
+        );
     }
 }

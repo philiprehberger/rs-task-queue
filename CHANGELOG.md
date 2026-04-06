@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0 (2026-04-06)
+
+- Add `TaskQueue::with_capacity()` for queue size limits with `TaskError::QueueFull`
+- Add `pause()`, `resume()`, and `is_paused()` for temporarily stopping task processing
+- Add `pending_count()` method for checking queue depth
+- Fix Support section emoji formatting in README
+
 ## 0.2.6 (2026-03-31)
 
 - Standardize README to 3-badge format with emoji Support section
