@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.0 (2026-04-06)
+
+- Add latency tracking to `TaskQueueStats` (`total_latency_nanos`, `completed_latency_samples`) and `average_latency()` accessor
+- Add integration test suite covering concurrent enqueue/drain, capacity exhaustion, pause/resume, and latency reporting
+- Add `data-structures` to crate categories
+- Document error-handling patterns (`TaskError::QueueFull` retry/backoff, `TaskError::Panicked` graceful degradation) in README
+
 ## 0.3.0 (2026-04-06)
 
 - Add `TaskQueue::with_capacity()` for queue size limits with `TaskError::QueueFull`
