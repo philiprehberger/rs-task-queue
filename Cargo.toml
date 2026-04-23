@@ -1,6 +1,6 @@
 [package]
 name = "philiprehberger-task-queue"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 authors = ["Philip Rehberger"]
 description = "In-process thread-based task queue with priority and concurrency control"
@@ -10,4 +10,4 @@ readme = "README.md"
 rust-version = "1.70"
 documentation = "https://docs.rs/philiprehberger-task-queue"
 keywords = ["task", "queue", "thread", "job", "background"]
-categories = ["concurrency"]
+categories = ["concurrency", "data-structures"]

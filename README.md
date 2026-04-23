@@ -10,7 +10,7 @@ In-process thread-based task queue with priority and concurrency control
 
 ```toml
 [dependencies]
-philiprehberger-task-queue = "0.3.0"
+philiprehberger-task-queue = "0.4.0"
 ```
 
 ## Usage
@@ -134,6 +134,60 @@ queue.resume(); // workers start processing again
 queue.shutdown();
 ```
 
+### Error Handling
+
+`submit` and `submit_with_priority` always return a `TaskHandle` — errors surface
+when you call `join()`. The two most common error cases are backpressure
+(`TaskError::QueueFull`) and task panics (`TaskError::Panicked`).
+
+**Retry with backoff on `QueueFull`:**
+
+```rust
+use philiprehberger_task_queue::{TaskQueue, TaskError};
+use std::thread;
+use std::time::Duration;
+
+let queue = TaskQueue::with_capacity(2, 4);
+
+let mut delay = Duration::from_millis(10);
+let result = loop {
+    let handle = queue.submit(|| "work");
+    match handle.join() {
+        Err(TaskError::QueueFull) => {
+            thread::sleep(delay);
+            delay = (delay * 2).min(Duration::from_secs(1));
+            continue;
+        }
+        other => break other,
+    }
+};
+let _ = result;
+queue.shutdown();
+```
+
+**Graceful degradation on `Panicked`:**
+
+```rust
+use philiprehberger_task_queue::{TaskQueue, TaskError};
+
+let queue = TaskQueue::new(2);
+let handle = queue.submit(|| {
+    if false { panic!("boom"); }
+    "ok"
+});
+
+let value = match handle.join() {
+    Ok(v) => v,
+    Err(TaskError::Panicked) => {
+        eprintln!("task panicked — falling back to default");
+        "fallback"
+    }
+    Err(_) => "fallback",
+};
+assert_eq!(value, "ok");
+queue.shutdown();
+```
+
 ### Queue Depth
 
 Check how many tasks are waiting:
@@ -154,7 +208,8 @@ queue.shutdown();
 | `TaskQueue::with_capacity(concurrency, max_queued)` | Create a queue with a maximum pending task limit |
 | `queue.submit(task)` | Submit a task at Normal priority; returns `TaskHandle<T>` |
 | `queue.submit_with_priority(priority, task)` | Submit a task at the given priority; returns `TaskHandle<T>` |
-| `queue.stats()` | Return a `TaskQueueStats` snapshot (submitted, completed, failed, in-flight) |
+| `queue.stats()` | Return a `TaskQueueStats` snapshot (submitted, completed, failed, in-flight, latency) |
+| `stats.average_latency()` | `Option<Duration>` average enqueue-to-completion latency, `None` if no tasks have finished |
 | `queue.drain()` | Stop accepting tasks, wait for all queued tasks to finish, then shut down |
 | `queue.on_complete(callback)` | Register a `Fn(bool, Duration)` callback fired after each task |
 | `queue.pause()` | Temporarily stop processing tasks |

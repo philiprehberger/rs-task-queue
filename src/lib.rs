@@ -99,6 +99,38 @@ pub struct TaskQueueStats {
     pub failed: u64,
     /// Number of tasks currently being executed by workers.
     pub in_flight: u64,
+    /// Sum of end-to-end latencies (enqueue -> completion) in nanoseconds
+    /// for every task that has finished (successfully or with a panic).
+    pub total_latency_nanos: u128,
+    /// Number of completed tasks that have contributed to `total_latency_nanos`.
+    pub completed_latency_samples: u64,
+}
+
+impl TaskQueueStats {
+    /// Return the average end-to-end task latency (enqueue -> completion).
+    ///
+    /// Returns `None` when no tasks have completed yet.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use philiprehberger_task_queue::TaskQueue;
+    ///
+    /// let queue = TaskQueue::new(1);
+    /// queue.submit(|| 1 + 1).join().unwrap();
+    /// let stats = queue.stats();
+    /// assert!(stats.average_latency().is_some());
+    /// queue.shutdown();
+    /// ```
+    pub fn average_latency(&self) -> Option<Duration> {
+        if self.completed_latency_samples == 0 {
+            return None;
+        }
+        let avg_nanos = self.total_latency_nanos / self.completed_latency_samples as u128;
+        // Cap to u64::MAX nanos (~584 years) — safe for all practical cases.
+        let capped = avg_nanos.min(u64::MAX as u128) as u64;
+        Some(Duration::from_nanos(capped))
+    }
 }
 
 /// Shared atomic counters used by the task queue for stats tracking.
@@ -107,6 +139,15 @@ struct StatsCounters {
     completed: AtomicU64,
     failed: AtomicU64,
     in_flight: AtomicU64,
+    /// Cumulative enqueue -> completion latency across all finished tasks.
+    /// Stored in a mutex because u128 has no stable atomic on all targets.
+    latency: Mutex<LatencyAccumulator>,
+}
+
+#[derive(Default)]
+struct LatencyAccumulator {
+    total_nanos: u128,
+    samples: u64,
 }
 
 impl StatsCounters {
@@ -116,6 +157,21 @@ impl StatsCounters {
             completed: AtomicU64::new(0),
             failed: AtomicU64::new(0),
             in_flight: AtomicU64::new(0),
+            latency: Mutex::new(LatencyAccumulator::default()),
+        }
+    }
+
+    fn record_latency(&self, elapsed: Duration) {
+        if let Ok(mut acc) = self.latency.lock() {
+            acc.total_nanos = acc.total_nanos.saturating_add(elapsed.as_nanos());
+            acc.samples = acc.samples.saturating_add(1);
+        }
+    }
+
+    fn snapshot_latency(&self) -> (u128, u64) {
+        match self.latency.lock() {
+            Ok(acc) => (acc.total_nanos, acc.samples),
+            Err(_) => (0, 0),
         }
     }
 }
@@ -149,8 +205,6 @@ impl<T> TaskResultSlot<T> {
         *guard = Some(value);
         self.condvar.notify_one();
     }
-
-
 }
 
 impl<T> TaskHandle<T> {
@@ -198,6 +252,7 @@ struct QueueEntry {
     priority: Priority,
     sequence: u64,
     task: BoxedTask,
+    enqueued_at: Instant,
 }
 
 impl Eq for QueueEntry {}
@@ -420,7 +475,9 @@ impl TaskQueue {
             Box::new(move || slot.set(value))
         });
 
-        self.stats.total_submitted.fetch_add(1, AtomicOrdering::Relaxed);
+        self.stats
+            .total_submitted
+            .fetch_add(1, AtomicOrdering::Relaxed);
 
         let (ref mutex, ref condvar) = *self.shared;
         let mut state = mutex.lock().unwrap();
@@ -430,6 +487,7 @@ impl TaskQueue {
             priority,
             sequence,
             task: boxed,
+            enqueued_at: Instant::now(),
         });
         condvar.notify_one();
 
@@ -456,11 +514,14 @@ impl TaskQueue {
     /// queue.shutdown();
     /// ```
     pub fn stats(&self) -> TaskQueueStats {
+        let (total_latency_nanos, completed_latency_samples) = self.stats.snapshot_latency();
         TaskQueueStats {
             total_submitted: self.stats.total_submitted.load(AtomicOrdering::Relaxed),
             completed: self.stats.completed.load(AtomicOrdering::Relaxed),
             failed: self.stats.failed.load(AtomicOrdering::Relaxed),
             in_flight: self.stats.in_flight.load(AtomicOrdering::Relaxed),
+            total_latency_nanos,
+            completed_latency_samples,
         }
     }
 
@@ -510,9 +571,7 @@ impl TaskQueue {
         // Wait until the queue is empty and no tasks are in-flight.
         {
             let mut state = mutex.lock().unwrap();
-            while !state.queue.is_empty()
-                || self.stats.in_flight.load(AtomicOrdering::SeqCst) > 0
-            {
+            while !state.queue.is_empty() || self.stats.in_flight.load(AtomicOrdering::SeqCst) > 0 {
                 state = condvar.wait(state).unwrap();
             }
         }
@@ -624,7 +683,7 @@ fn worker_loop(
             loop {
                 if !state.paused || state.draining {
                     if let Some(entry) = state.queue.pop() {
-                        break Some(entry.task);
+                        break Some((entry.task, entry.enqueued_at));
                     }
                 }
                 if state.shutdown || (state.draining && state.queue.is_empty()) {
@@ -634,11 +693,13 @@ fn worker_loop(
             }
         };
         match task {
-            Some(task) => {
+            Some((task, enqueued_at)) => {
                 stats.in_flight.fetch_add(1, AtomicOrdering::SeqCst);
                 let start = Instant::now();
                 let completion = task();
                 let elapsed = start.elapsed();
+                let total_latency = enqueued_at.elapsed();
+                stats.record_latency(total_latency);
                 stats.in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
 
                 // The task closure uses catch_unwind internally and communicates
